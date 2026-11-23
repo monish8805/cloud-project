@@ -1,0 +1,122 @@
+import express from "express";
+import { httpErrorMessage, TOMBSTONE } from "@emergency/shared";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+
+export interface Entry {
+  value: unknown;
+  version: number;
+}
+
+export interface StorageOptions {
+  // When set, the data is written here on every change and reloaded on start.
+  dataFile?: string;
+  // Entries loaded from an external store (MongoDB) before the app starts.
+  initial?: Array<[string, Entry]>;
+  // Called after every applied write so an external store (MongoDB) can save the entry.
+  onWrite?: (key: string, entry: Entry) => Promise<void>;
+  // Reported on /health.
+  backend?: string;
+}
+
+// One storage node: a versioned key-value store exposed over HTTP.
+// Every write carries a version from the coordinator. A write older than what the
+// node already holds is ignored, so a late or replayed write can never undo a newer one.
+export function createStorageApp(nodeId: string, shard: number, options: StorageOptions = {}) {
+  const data = new Map<string, Entry>();
+  const { dataFile, initial, onWrite, backend } = options;
+  if (initial) for (const [key, entry] of initial) data.set(key, entry);
+
+  if (dataFile) {
+    mkdirSync(dirname(dataFile), { recursive: true });
+    if (existsSync(dataFile)) {
+      const saved = JSON.parse(readFileSync(dataFile, "utf8")) as Array<[string, Entry]>;
+      for (const [key, entry] of saved) data.set(key, entry);
+    }
+  }
+
+  // Writes are serialized and go through a temp file + rename, so a crash never leaves a torn file.
+  let writing: Promise<void> = Promise.resolve();
+  const persist = (): Promise<void> => {
+    if (!dataFile) return Promise.resolve();
+    const snapshot = JSON.stringify([...data.entries()]);
+    const next = writing.then(async () => {
+      await writeFile(`${dataFile}.tmp`, snapshot);
+      await rename(`${dataFile}.tmp`, dataFile);
+    });
+    writing = next.catch(() => {});
+    return next;
+  };
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+
+  app.get("/health", (_req, res) => {
+    res.json({ ok: true, nodeId, shard, keys: data.size, persistent: Boolean(dataFile || onWrite), backend: backend ?? (dataFile ? "file" : "memory") });
+  });
+
+  // Used by the coordinator to reconcile a node that has just recovered: [key, value, version].
+  // With ?prefix=... only the keys starting with it are returned, so a caller that wants one kind
+  // of record does not have to receive (and then throw away) everything else.
+  app.get("/internal/dump", (req, res) => {
+    const prefix = typeof req.query.prefix === "string" ? req.query.prefix : "";
+    res.json(
+      [...data.entries()].filter(([key]) => key.startsWith(prefix)).map(([key, e]) => [key, e.value, e.version]),
+    );
+  });
+
+  app.get("/internal/data/:key", (req, res) => {
+    const entry = data.get(req.params.key);
+    if (!entry) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    res.set("x-version", String(entry.version));
+    res.json(entry.value);
+  });
+
+  // Stores a value (or a tombstone) unless the node already holds a newer version.
+  async function apply(key: string, value: unknown, version: number) {
+    const existing = data.get(key);
+    if (existing && existing.version > version) return { ok: true, applied: false, version: existing.version };
+    const entry = { value, version };
+    data.set(key, entry);
+    await persist();
+    if (onWrite) await onWrite(key, entry);
+    return { ok: true, applied: true, version };
+  }
+
+  app.put("/internal/data/:key", async (req, res) => {
+    if (req.body === undefined) {
+      res.status(400).json({ error: "JSON body required" });
+      return;
+    }
+    const version = Number(req.header("x-version"));
+    if (!Number.isFinite(version)) {
+      res.status(400).json({ error: "x-version header required" });
+      return;
+    }
+    res.json(await apply(req.params.key, req.body, version));
+  });
+
+  // Deleting writes a tombstone at the given version (see shared/src/tombstone.ts).
+  app.delete("/internal/data/:key", async (req, res) => {
+    const version = Number(req.header("x-version"));
+    if (!Number.isFinite(version)) {
+      res.status(400).json({ error: "x-version header required" });
+      return;
+    }
+    res.json(await apply(req.params.key, TOMBSTONE, version));
+  });
+
+  app.get("/", (_req, res) => res.json({ service: "storage-node", nodeId, shard }));
+
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = typeof (err as { status?: unknown }).status === "number" ? (err as { status: number }).status : 500;
+    if (status === 500) console.error(err);
+    res.status(status).json({ error: httpErrorMessage(status, "1mb") });
+  });
+
+  return { app, data };
+}
