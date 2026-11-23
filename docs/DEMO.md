@@ -1,0 +1,52 @@
+# Final demonstration
+
+Prerequisite: Docker Desktop running, then `./scripts/deploy-k8s.sh` (starts minikube, builds images, deploys everything).
+
+Open these in separate terminals before you start:
+
+```bash
+# T1: the UI (opens a browser)
+minikube service web -n emergency
+
+# T2: watch pods live
+kubectl -n emergency get pods -w
+
+# T3: RabbitMQ management UI, http://localhost:15672
+#     login: emergency / the password from:  kubectl -n emergency get secret rabbitmq-credentials -o jsonpath='{.data.RABBITMQ_DEFAULT_PASS}' | base64 -d
+kubectl -n emergency port-forward svc/rabbitmq 15672:15672
+
+# T4: matching service log, shows each match as it happens
+kubectl -n emergency logs -f deploy/matching-service
+```
+
+Handy helpers:
+
+```bash
+API=$(minikube service request-service -n emergency --url)    # leave this terminal open
+```
+
+## Steps
+
+| # | Step | What to do | What to point out |
+|---|------|-----------|-------------------|
+| 1 | Create request | In the UI: type `water`, location `12.97, 77.59`, submit | Row appears as `PENDING` |
+| 2 | Register resource | In the UI: type `water`, same location, register | Appears as `AVAILABLE` |
+| 3 | RabbitMQ receives request | RabbitMQ UI → Queues → `match.requests` (message rates spike). Or `kubectl -n emergency exec rabbitmq-0 -- rabbitmqctl list_queues name messages consumers` | Request Service publishes, queue has 1 consumer |
+| 4 | Matching happens | Watch T4 and the UI | Log says `assigned`; request flips to `ASSIGNED`, resource to `ASSIGNED` |
+| 5 | Data distributed across shards | `for p in storage-s{0,1,2}-0; do echo $p; kubectl -n emergency exec $p -- wget -qO- http://localhost:4000/internal/dump \| jq length; done` (create ~10 requests first so every shard has data) | Keys land on different shards (`hash(key) mod 3`); the `-1` and `-2` pods hold identical copies |
+| 6 | Kill storage node | `kubectl -n emergency delete pod storage-s0-0 --grace-period=0 --force` | Coordinator logs `marked down` (or `unreachable`); `curl $API/system \| jq '.coordinator.nodes'` shows it `down` |
+| 7 | Replica continues serving | Refresh the UI, create another request | Everything still readable and writable: the other two nodes of shard 0 are a quorum |
+| 8 | Recover storage node | Pod comes back by itself (StatefulSet). `kubectl -n emergency logs -l app=coordinator --prefix --tail=20` | `node ... is back, reconciling`, then `reconciled ... N keys differed` and `node ... is up`; verify with the dump command from step 5 (same keys and versions as its two peers) |
+| 9 | Kill Kubernetes pod | `kubectl -n emergency delete pod -l app=request-service --grace-period=0 --force` | UI keeps working through the other replica |
+| 9b | Kill the active coordinator | `kubectl -n emergency get lease coordinator -o jsonpath='{.spec.holderIdentity}'`, then delete that pod | Requests fail for a few seconds at most, then the other coordinator logs `is now the leader`, re-reconciles the nodes and everything works again |
+| 10 | Kubernetes recreates it | Watch T2 | New pod appears and goes `Running` within seconds |
+| 11 | Scale service | `kubectl -n emergency scale deploy/request-service --replicas=4` then `deploy/matching-service --replicas=3` | T2 shows new pods. (The autoscalers in `k8s/70-autoscaling.yaml` will move the count back on their own once CPU is low; `kubectl get hpa -n emergency` shows them) |
+| 12 | System remains available | Submit several requests in the UI while scaling | All accepted and matched |
+
+## Automated proof
+
+`node scripts/e2e.mjs` (minikube) or `MODE=compose node scripts/e2e.mjs` runs all of the above plus concurrent claims on one resource, a matcher outage and a RabbitMQ outage, and prints PASS/FAIL per test.
+
+## Limitations to mention honestly
+
+See the Limitations section of the README. In short: one active coordinator (up to 15 seconds of 503 while the standby takes over), a shard with two of its three nodes down is unavailable until one returns (no data is lost), and matching is exact on type and location text.
