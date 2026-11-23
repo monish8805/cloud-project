@@ -1,0 +1,257 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-s0
+  namespace: emergency
+spec:
+  clusterIP: None
+  # Publish DNS for pods before they are ready so the coordinator can always reach them.
+  publishNotReadyAddresses: true
+  selector: {app: storage, shard: "0"}
+  ports:
+    - {port: 4000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: storage-s0
+  namespace: emergency
+spec:
+  serviceName: storage-s0
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: storage, shard: "0"}
+  template:
+    metadata:
+      labels: {app: storage, shard: "0"}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000          # so the volume of a storage node is writable by the non-root user
+        seccompProfile: {type: RuntimeDefault}
+      # Prefer putting the three nodes of a shard on different machines, so one machine failing
+      # cannot take out a majority. "Preferred" so a single-node cluster (minikube) still schedules.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app: storage, shard: "0"}
+      containers:
+        - name: storage
+          image: emergency/storage-node:latest
+          imagePullPolicy: Never
+          env:
+            - name: NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: SHARD, value: "0"}
+            - {name: PORT, value: "4000"}
+            - {name: DATA_DIR, value: /data}
+            - name: MONGODB_URI   # optional: from `kubectl create secret generic mongodb-credentials --from-literal=uri=...`
+              valueFrom: {secretKeyRef: {name: mongodb-credentials, key: uri, optional: true}}
+            - {name: MONGODB_DB, value: emergency}
+            - name: COORDINATOR_URL
+              valueFrom: {configMapKeyRef: {name: app-config, key: COORDINATOR_URL}}
+          ports:
+            - {containerPort: 4000}
+          readinessProbe:
+            httpGet: {path: /health, port: 4000}
+            periodSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: 4000}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-s1
+  namespace: emergency
+spec:
+  clusterIP: None
+  # Publish DNS for pods before they are ready so the coordinator can always reach them.
+  publishNotReadyAddresses: true
+  selector: {app: storage, shard: "1"}
+  ports:
+    - {port: 4000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: storage-s1
+  namespace: emergency
+spec:
+  serviceName: storage-s1
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: storage, shard: "1"}
+  template:
+    metadata:
+      labels: {app: storage, shard: "1"}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000          # so the volume of a storage node is writable by the non-root user
+        seccompProfile: {type: RuntimeDefault}
+      # Prefer putting the three nodes of a shard on different machines, so one machine failing
+      # cannot take out a majority. "Preferred" so a single-node cluster (minikube) still schedules.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app: storage, shard: "1"}
+      containers:
+        - name: storage
+          image: emergency/storage-node:latest
+          imagePullPolicy: Never
+          env:
+            - name: NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: SHARD, value: "1"}
+            - {name: PORT, value: "4000"}
+            - {name: DATA_DIR, value: /data}
+            - name: MONGODB_URI   # optional: from `kubectl create secret generic mongodb-credentials --from-literal=uri=...`
+              valueFrom: {secretKeyRef: {name: mongodb-credentials, key: uri, optional: true}}
+            - {name: MONGODB_DB, value: emergency}
+            - name: COORDINATOR_URL
+              valueFrom: {configMapKeyRef: {name: app-config, key: COORDINATOR_URL}}
+          ports:
+            - {containerPort: 4000}
+          readinessProbe:
+            httpGet: {path: /health, port: 4000}
+            periodSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: 4000}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-s2
+  namespace: emergency
+spec:
+  clusterIP: None
+  # Publish DNS for pods before they are ready so the coordinator can always reach them.
+  publishNotReadyAddresses: true
+  selector: {app: storage, shard: "2"}
+  ports:
+    - {port: 4000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: storage-s2
+  namespace: emergency
+spec:
+  serviceName: storage-s2
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: storage, shard: "2"}
+  template:
+    metadata:
+      labels: {app: storage, shard: "2"}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000          # so the volume of a storage node is writable by the non-root user
+        seccompProfile: {type: RuntimeDefault}
+      # Prefer putting the three nodes of a shard on different machines, so one machine failing
+      # cannot take out a majority. "Preferred" so a single-node cluster (minikube) still schedules.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app: storage, shard: "2"}
+      containers:
+        - name: storage
+          image: emergency/storage-node:latest
+          imagePullPolicy: Never
+          env:
+            - name: NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: SHARD, value: "2"}
+            - {name: PORT, value: "4000"}
+            - {name: DATA_DIR, value: /data}
+            - name: MONGODB_URI   # optional: from `kubectl create secret generic mongodb-credentials --from-literal=uri=...`
+              valueFrom: {secretKeyRef: {name: mongodb-credentials, key: uri, optional: true}}
+            - {name: MONGODB_DB, value: emergency}
+            - name: COORDINATOR_URL
+              valueFrom: {configMapKeyRef: {name: app-config, key: COORDINATOR_URL}}
+          ports:
+            - {containerPort: 4000}
+          readinessProbe:
+            httpGet: {path: /health, port: 4000}
+            periodSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: 4000}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 256Mi}

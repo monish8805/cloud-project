@@ -1,0 +1,310 @@
+import express from "express";
+import { randomUUID } from "node:crypto";
+import {
+  createRequestSchema,
+  registerResourceSchema,
+  requestKey,
+  requestStatusSchema,
+  resourceKey,
+  newResourceId,
+  resourceStatusSchema,
+  REQUEST_PREFIX,
+  RESOURCE_PREFIX,
+  InvalidTransitionError,
+  StoreUnavailableError,
+  UpdateConflictError,
+  InvalidCursorError,
+  IDEMPOTENCY_KEY,
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  idFromIdempotencyKey,
+  paginate,
+  parseCoordinates,
+  resourcePrefix,
+  httpErrorMessage,
+  REQUEST_TYPES,
+  canTransition,
+  REQUEST_TRANSITIONS,
+  updateRecord,
+  type EmergencyRequest,
+  type KeyValueStore,
+  type Resource,
+} from "@emergency/shared";
+import type { ZodError } from "zod";
+
+export interface RequestAppDeps {
+  store: KeyValueStore;
+  publishMatch: (requestId: string) => Promise<void>;
+  // Optional probes used by GET /system. When absent the component is reported as "unknown".
+  checkRabbit?: () => Promise<boolean>;
+  coordinatorHealth?: () => Promise<unknown>;
+  // Optional list of allowed zone names (case-insensitive). When set, a location must be valid
+  // coordinates or one of these zones, so typos like "asdf" are refused instead of stored.
+  zones?: string[];
+}
+
+const BODY_LIMIT = "100kb";
+
+export function createRequestApp({ store, publishMatch, checkRabbit, coordinatorHealth, zones }: RequestAppDeps) {
+  const app = express();
+  app.use(express.json({ limit: BODY_LIMIT }));
+
+  const invalid = (res: express.Response, error: ZodError) =>
+    res.status(400).json({ error: "invalid request", details: error.flatten() });
+
+  const allowedZones = zones && zones.length > 0 ? new Set(zones.map((z) => z.trim().toLowerCase())) : null;
+  const unknownZone = (location: string) =>
+    allowedZones !== null && !parseCoordinates(location) && !allowedZones.has(location.trim().toLowerCase());
+  const rejectZone = (res: express.Response) =>
+    res.status(400).json({
+      error: "invalid request",
+      details: { fieldErrors: { location: [`unknown zone, use coordinates or one of: ${[...(zones ?? [])].join(", ")}`] } },
+    });
+
+  // Reads the optional Idempotency-Key header. Returns undefined when absent, null after replying 400.
+  const idempotencyKey = (req: express.Request, res: express.Response): string | undefined | null => {
+    const raw = req.header("idempotency-key");
+    if (raw === undefined) return undefined;
+    if (!IDEMPOTENCY_KEY.test(raw)) {
+      res.status(400).json({ error: "Idempotency-Key must be 8-100 characters: letters, digits, _ or -" });
+      return null;
+    }
+    return raw;
+  };
+
+  // ?limit= and ?cursor= for the list endpoints. Replies 400 and returns null when they are invalid.
+  const pageParams = (req: express.Request, res: express.Response) => {
+    const rawLimit = req.query.limit;
+    const limit = rawLimit === undefined ? DEFAULT_PAGE_SIZE : Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) {
+      res.status(400).json({ error: `limit must be a whole number from 1 to ${MAX_PAGE_SIZE}` });
+      return null;
+    }
+    const cursor = typeof req.query.cursor === "string" && req.query.cursor ? req.query.cursor : undefined;
+    return { limit, cursor };
+  };
+
+  app.get("/", (_req, res) =>
+    res.json({ service: "request-service", health: "/health", system: "/system", docs: "see README" }),
+  );
+
+  app.post("/requests", async (req, res) => {
+    const parsed = createRequestSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    if (unknownZone(parsed.data.location)) return rejectZone(res);
+    const key = idempotencyKey(req, res);
+    if (key === null) return;
+
+    const record: EmergencyRequest = {
+      // With an Idempotency-Key the id comes from the key, so a retry targets the same record.
+      id: key ? idFromIdempotencyKey(key) : randomUUID(),
+      ...parsed.data,
+      status: "PENDING",
+      resourceId: null,
+      createdAt: new Date().toISOString(),
+    };
+    // Create-only: succeeds only if the record does not exist yet.
+    let replay = false;
+    if (!(await store.cas(requestKey(record.id), null, record))) {
+      const existing = await store.get<EmergencyRequest>(requestKey(record.id));
+      if (
+        !existing ||
+        existing.type !== record.type ||
+        existing.location !== record.location ||
+        existing.details !== record.details
+      ) {
+        return res.status(409).json({ error: "Idempotency-Key was already used for a different request" });
+      }
+      // A retry of a request that was stored (even if the first attempt was answered 503).
+      // Return it as it is now; queue matching again only if it is still waiting.
+      if (existing.status !== "PENDING") return res.set("idempotent-replay", "true").status(200).json(existing);
+      replay = true;
+      Object.assign(record, existing);
+    }
+    try {
+      await publishMatch(record.id);
+    } catch (err) {
+      // The request is safely stored as PENDING. The matching service re-queues stuck
+      // PENDING requests, so it is matched once RabbitMQ is back. Tell the caller.
+      console.error(`could not queue request ${record.id}, the sweeper will retry: ${String(err)}`);
+      res.set("x-match-queued", "false");
+    }
+    if (replay) res.set("idempotent-replay", "true");
+    res.status(replay ? 200 : 201).json(record);
+  });
+
+  app.get("/requests", async (req, res) => {
+    const page = pageParams(req, res);
+    if (!page) return;
+    const entries = await store.list<EmergencyRequest>(REQUEST_PREFIX);
+    // Newest first; the id breaks ties so the order (and every cursor) is stable.
+    const requests = entries
+      .map((e) => e.value)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    res.json(paginate(requests, (r) => r.id, page.cursor, page.limit));
+  });
+
+  app.get("/requests/:id", async (req, res) => {
+    const record = await store.get<EmergencyRequest>(requestKey(req.params.id));
+    if (!record) return res.status(404).json({ error: "request not found" });
+    res.json(record);
+  });
+
+  app.put("/requests/:id/status", async (req, res) => {
+    const parsed = requestStatusSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    const updated = await updateRecord<EmergencyRequest>(store, requestKey(req.params.id), (r) => {
+      if (r.status === parsed.data.status) return r;
+      // Checked against the exact record that is being replaced, so it cannot race with the matcher.
+      if (!canTransition(r.status, parsed.data.status)) throw new InvalidTransitionError(r.status, parsed.data.status);
+      return { ...r, status: parsed.data.status };
+    });
+    if (!updated) return res.status(404).json({ error: "request not found" });
+
+    // A finished or cancelled request gives its resource back.
+    if ((updated.status === "CANCELLED" || updated.status === "COMPLETED") && updated.resourceId) {
+      await updateRecord<Resource>(store, resourceKey(updated.resourceId), (r) =>
+        r.assignedRequestId === updated.id
+          ? { ...r, status: "AVAILABLE", availability: true, assignedRequestId: null }
+          : r,
+      );
+    }
+    res.json(updated);
+  });
+
+  app.post("/resources", async (req, res) => {
+    const parsed = registerResourceSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    if (unknownZone(parsed.data.location)) return rejectZone(res);
+    const key = idempotencyKey(req, res);
+    if (key === null) return;
+    const { availability, ...rest } = parsed.data;
+    const record: Resource = {
+      id: newResourceId(rest.type, key ? idFromIdempotencyKey(key) : randomUUID()),
+      ...rest,
+      availability,
+      status: availability ? "AVAILABLE" : "UNAVAILABLE",
+      assignedRequestId: null,
+    };
+    if (!(await store.cas(resourceKey(record.id), null, record))) {
+      const existing = await store.get<Resource>(resourceKey(record.id));
+      if (!existing || existing.type !== record.type || existing.location !== record.location) {
+        return res.status(409).json({ error: "Idempotency-Key was already used for a different resource" });
+      }
+      return res.set("idempotent-replay", "true").status(200).json(existing);
+    }
+    res.status(201).json(record);
+  });
+
+  app.get("/resources", async (req, res) => {
+    const page = pageParams(req, res);
+    if (!page) return;
+    // ?type=water lists only that type: the storage nodes filter by key prefix themselves.
+    const type = req.query.type;
+    if (type !== undefined && !(REQUEST_TYPES as readonly unknown[]).includes(type)) {
+      return res.status(400).json({ error: `type must be one of: ${REQUEST_TYPES.join(", ")}` });
+    }
+    const entries = await store.list<Resource>(type === undefined ? RESOURCE_PREFIX : resourcePrefix(type as (typeof REQUEST_TYPES)[number]));
+    const resources = entries.map((e) => e.value).sort((a, b) => a.id.localeCompare(b.id));
+    res.json(paginate(resources, (r) => r.id, page.cursor, page.limit));
+  });
+
+  app.put("/resources/:id/status", async (req, res) => {
+    const parsed = resourceStatusSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    const current = await store.get<Resource>(resourceKey(req.params.id));
+    if (!current) return res.status(404).json({ error: "resource not found" });
+
+    // If this resource is serving a request and is now being made available again or taken out,
+    // that request goes back to PENDING first. Otherwise the resource could be matched to someone
+    // else while the original request still believes it has it (two requests, one resource).
+    // Order matters: if we crash between the two steps the request is PENDING and the resource is
+    // still claimed for it, which the matcher completes safely instead of double-assigning.
+    let releasedRequestId: string | undefined;
+    if (current.assignedRequestId && parsed.data.status !== "ASSIGNED") {
+      const owner = current.assignedRequestId;
+      const released = await updateRecord<EmergencyRequest>(store, requestKey(owner), (r) =>
+        r.resourceId === current.id && (r.status === "ASSIGNED" || r.status === "IN_PROGRESS")
+          ? { ...r, status: "PENDING", resourceId: null, distanceKm: null }
+          : r,
+      );
+      if (released?.status === "PENDING" && released.resourceId === null) releasedRequestId = owner;
+    }
+
+    const updated = await updateRecord<Resource>(store, resourceKey(current.id), (r) => ({
+      ...r,
+      status: parsed.data.status,
+      availability: parsed.data.status === "AVAILABLE",
+      assignedRequestId: parsed.data.status === "ASSIGNED" ? (r.assignedRequestId ?? null) : null,
+    }));
+    if (!updated) return res.status(404).json({ error: "resource not found" });
+
+    if (releasedRequestId) {
+      // Look for another resource right away. If queueing fails, the matcher's sweeper picks it up.
+      await publishMatch(releasedRequestId).catch((err) =>
+        console.error(`could not re-queue request ${releasedRequestId}, the sweeper will retry: ${String(err)}`),
+      );
+    }
+    res.json(releasedRequestId ? { ...updated, releasedRequestId } : updated);
+  });
+
+  app.post("/match/:requestId", async (req, res) => {
+    const record = await store.get<EmergencyRequest>(requestKey(req.params.requestId));
+    if (!record) return res.status(404).json({ error: "request not found" });
+    if (record.status !== "PENDING") {
+      return res.status(409).json({ error: "request is not pending", status: record.status });
+    }
+    try {
+      await publishMatch(record.id);
+    } catch (err) {
+      console.error(`could not queue match for ${record.id}: ${String(err)}`);
+      return res.status(503).json({ error: "message queue unavailable" });
+    }
+    res.json({ requestId: record.id, queued: true });
+  });
+
+  // Liveness: the process is up. Does not depend on other services.
+  app.get("/health", (_req, res) => res.json({ ok: true }));
+
+  // Overall picture for the UI: this service, RabbitMQ, and every storage node.
+  app.get("/system", async (_req, res) => {
+    const [rabbit, coordinator] = await Promise.all([
+      checkRabbit ? checkRabbit().catch(() => false) : Promise.resolve(undefined),
+      coordinatorHealth
+        ? coordinatorHealth().then(
+            (h) => ({ reachable: true, ...(h as object) }),
+            (e) => ({ reachable: false, error: String(e) }),
+          )
+        : Promise.resolve(undefined),
+    ]);
+    res.json({
+      requestService: "up",
+      rabbitmq: rabbit === undefined ? "unknown" : rabbit ? "up" : "down",
+      coordinator: coordinator ?? { reachable: null },
+    });
+  });
+
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (err instanceof StoreUnavailableError) {
+      console.error(String(err));
+      return res.status(503).json({ error: "storage unavailable" });
+    }
+    if (err instanceof InvalidTransitionError) {
+      return res.status(409).json({
+        error: err.message,
+        from: err.from,
+        to: err.to,
+        allowed: REQUEST_TRANSITIONS[err.from],
+      });
+    }
+    if (err instanceof UpdateConflictError) {
+      return res.status(409).json({ error: "too many concurrent changes, try again" });
+    }
+    if (err instanceof InvalidCursorError) return res.status(400).json({ error: "invalid cursor" });
+    const status = typeof (err as { status?: unknown }).status === "number" ? (err as { status: number }).status : 500;
+    if (status === 500) console.error(err);
+    res.status(status).json({ error: httpErrorMessage(status, BODY_LIMIT) });
+  });
+
+  return app;
+}
