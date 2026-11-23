@@ -1,0 +1,67 @@
+# A StatefulSet with a volume: queued jobs survive a broker pod restart.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: emergency
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels: {app: rabbitmq}
+  template:
+    metadata:
+      labels: {app: rabbitmq}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999          # the broker data volume is writable by the rabbitmq user (uid 999)
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management
+          envFrom:
+            - secretRef: {name: rabbitmq-credentials}
+          ports:
+            - {containerPort: 5672}
+            - {containerPort: 15672}
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/rabbitmq}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: emergency
+spec:
+  selector: {app: rabbitmq}
+  ports:
+    - {name: amqp, port: 5672}
+    - {name: management, port: 15672}

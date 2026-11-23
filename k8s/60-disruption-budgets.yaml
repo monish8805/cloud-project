@@ -1,0 +1,52 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: storage-s0
+  namespace: emergency
+spec:
+  # During a node drain or upgrade, never take more than one node of a shard down: two of three is a quorum.
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: storage, shard: "0"}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: storage-s1
+  namespace: emergency
+spec:
+  # During a node drain or upgrade, never take more than one node of a shard down: two of three is a quorum.
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: storage, shard: "1"}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: storage-s2
+  namespace: emergency
+spec:
+  # During a node drain or upgrade, never take more than one node of a shard down: two of three is a quorum.
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: storage, shard: "2"}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: request-service
+  namespace: emergency
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: request-service}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coordinator
+  namespace: emergency
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: coordinator}
